@@ -36,3 +36,15 @@ runs/
 .gemini/
 AGENTS.md
 !requirements.txt
+
+# Paper & Reports
+бшнд/
+overleaf_package/
+*.tex
+*.bib
+make_report_*.py
+REPORT_REVIEW.md
+EXPERIMENT_SUMMARY.md
+PROJECT_OVERVIEW.md
+CURRENT_STATE.md
+report*.md
