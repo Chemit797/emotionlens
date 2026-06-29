@@ -1,0 +1,156 @@
+% =====================================================================
+% Chapter 4: Implementation
+% Based on leader's framework (AIT202_DL.pdf)
+% =====================================================================
+\section{Implementation}
+\label{sec:impl}
+
+This section details the seven-step pipeline from image capture to personalized checkpoint creation, the network architecture, the training process, and the two technological innovations introduced by this research effort: subject-aware sampling and the two-stage personalization process.
+
+\subsection{System Pipeline}
+\label{sec:impl:pipeline}
+
+Figure~\ref{fig:pipeline} shows the seven stages of the pipeline. Each stage is a separate Python script that lives either at the project root or under the \texttt{training} subdirectory.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{pipeline_flowchart.png}
+  \caption{End-to-end pipeline. Blue boxes are data preparation stages; orange boxes are the two stages contributed by this project (subject-aware sampling during training and the personalization fine-tuning step); green boxes are the saved model files that feed the live demo.}
+  \label{fig:pipeline}
+\end{figure}
+
+Steps one to four generate the self-collected data. The script \texttt{capture.py} captures frames from the laptop webcam and saves them to disk in directories according to each subject and each session. The script \texttt{prelabel.py} generates weak labels using a small pre-trained model such that the reviewer starts with some educated guesses rather than starting from scratch. The script \texttt{review\_app.py} is a small Streamlit web application that allows a team member to go through all the frames and verify or correct the label. The script \texttt{gather.py} merges the per-subject CSV files into a \texttt{prelabels.csv} file in the root directory of the project, taking care of duplication and path normalizing such that frames collected on a Windows system and those collected on a macOS system have the same path format.
+
+The other three steps involve preparing the training dataset and training the network. The script \texttt{face\_crop.py} applies the MTCNN algorithm on all self-captured frames and saves a tight crop of size $224 \times 224$ pixels in a separate directory tree (\texttt{raw\_face/}). The script \texttt{merge\_ferplus.py} combines the self-captured subset with FER+ and RAF-DB datasets into three CSV files (\texttt{dataset/train.csv}, \texttt{dataset/val.csv} and \texttt{dataset/test.csv}). The script \texttt{train.py} loads these CSV files, adds the subject-aware oversampler, trains the ResNet-18 network and saves the best checkpoint by validation accuracy. Finally, the script \texttt{finetune.py} loads the generic checkpoint, performs the personalization step on a target subject and saves a personalized checkpoint.
+
+\subsection{Model Architecture and Backbone Selection}
+\label{sec:impl:arch}
+
+We picked ResNet-18 \autocite{he2016resnet} as the backbone after looking at three architecture families that are commonly used for FER. VGG-16 \autocite{simonyan2015vgg} is a simple stack of $3\times 3$ convolutions and reaches strong accuracy on FER test sets, but its $138.4$ million parameters make it slow to train and heavy to deploy on the laptop that hosts our application. EfficientNet-B0 \autocite{tan2019efficientnet} has the opposite trade-off: with only $4.0$ million parameters it is the most parameter-efficient choice, but in the comparison reported in Section~\ref{sec:results:archabl} it gave slightly lower accuracy than ResNet-18 on every test slice rather than improving on it. ResNet-18 is in between at $11.2$ million parameters; its residual connections \autocite{he2016resnet} let the network train without the loss-of-accuracy problem that hits deeper plain networks, its ImageNet pretraining transfers well to faces because the early layers learn edges and textures that are useful for any image task, and the whole network fits on one laptop GPU at batch size $128$. We therefore use ResNet-18 for the rest of this report and report the controlled comparison against VGG-16 in Section~\ref{sec:results:archabl}.
+
+The model is the ResNet-18 backbone with ImageNet weights, where the original $1000$-class fully connected head is replaced by a linear layer that maps the $512$-dimensional pooled feature to our seven emotion classes. Figure~\ref{fig:arch} shows the layout and marks which blocks are trainable at each stage.
+
+\begin{figure}[H]
+  \centering
+  \resizebox{\linewidth}{!}{%
+  \begin{tikzpicture}[node distance=3.5mm]
+    \tikzstyle{blk}=[gap2block, minimum width=22mm, minimum height=8mm,
+                     font=\footnotesize, fill=blue!7]
+    \tikzstyle{frz}=[blk, fill=gray!8, draw=gray!60]
+    \tikzstyle{tun}=[blk, fill=orange!15, draw=orange!70!black]
+    \tikzstyle{io}=[blk, fill=green!10, draw=green!60!black]
+
+    \node[io]                    (in)  {$224\times224$ RGB};
+    \node[frz, right=of in]      (s1)  {conv1+bn1};
+    \node[frz, right=of s1]      (s2)  {layer1};
+    \node[frz, right=of s2]      (s3)  {layer2};
+    \node[frz, right=of s3]      (s4)  {layer3};
+    \node[tun, right=of s4]      (s5)  {layer4};
+    \node[tun, right=of s5]      (s6)  {avgpool+fc};
+    \node[io,  right=of s6]      (out) {$7$ logits};
+
+    \draw[gap2arr] (in) -- (s1);
+    \draw[gap2arr] (s1) -- (s2);
+    \draw[gap2arr] (s2) -- (s3);
+    \draw[gap2arr] (s3) -- (s4);
+    \draw[gap2arr] (s4) -- (s5);
+    \draw[gap2arr] (s5) -- (s6);
+    \draw[gap2arr] (s6) -- (out);
+  \end{tikzpicture}}
+  \caption{ResNet-18 backbone with a $7$-class linear head. At generic training all blocks are trainable. At the personalization stage the gray blocks (\texttt{conv1}, \texttt{bn1}, \texttt{layer1}, \texttt{layer2}, \texttt{layer3}) are frozen and only the orange blocks (\texttt{layer4} and the head) receive gradient updates, which corresponds to $8{,}397{,}319$ trainable parameters out of $11{,}180{,}103$ in total ($75.1\%$).}
+  \label{fig:arch}
+\end{figure}
+
+Inputs are resized to $224\times 224$ and normalized with the ImageNet mean and standard deviation. At training time we also apply random crop, random horizontal flip, colour jitter and random erasing as standard image augmentations. For the self-captured frames we use the MTCNN face crop directory when it is present; FER+ and RAF-DB faces are already cropped and aligned by their dataset preparation scripts. At evaluation time we also use horizontal-flip test-time augmentation: we average the softmax probabilities of the original image and its horizontal mirror before taking the argmax.
+
+\subsection{Training Procedure}
+\label{sec:impl:training}
+
+The generic model is trained with cross-entropy loss on the seven-class label space, weighted to compensate for class imbalance and softened with label smoothing of $0.1$ \autocite{szegedy2016rethinking}. Class weights are computed from the training distribution as $w_c = N / (C\cdot N_c)$, where $N$ is the total number of training frames, $C=7$ is the number of classes and $N_c$ is the count of class $c$. After the user2 contribution the disgust and fear classes still receive the largest weights (around $5.4$ to $5.9$), because they remain the rarest classes once contempt is dropped.
+
+The optimizer is AdamW \autocite{loshchilov2019adamw} with learning rate $1\times 10^{-4}$ and weight decay $1\times 10^{-4}$, and the learning rate follows a cosine schedule that decays from the initial value down to zero over the planned $30$ epochs. We train with batch size $128$ on an NVIDIA T4 GPU. Early stopping is enabled with a patience of $8$ epochs, although in the final run the patience trigger did not fire and training ran the full $30$ epochs. The best checkpoint by overall validation accuracy is saved to \texttt{checkpoints/best.pt}. Table~\ref{tab:hparam} gathers all the hyperparameters in one place.
+
+\begin{table}[H]
+  \centering
+  \footnotesize
+  \begin{tabular}{lll}
+    \toprule
+    Group & Hyperparameter & Value \\
+    \midrule
+    Optimizer & AdamW \autocite{loshchilov2019adamw} & $\beta_1=0.9$, $\beta_2=0.999$ \\
+              & Learning rate         & $1\times 10^{-4}$ \\
+              & Weight decay          & $1\times 10^{-4}$ \\
+              & LR schedule           & Cosine annealing, $T_{\max}=30$ \\
+    Loss      & Cross-entropy weights & Inverse class frequency \\
+              & Label smoothing       & $0.1$ \\
+    Sampling  & Self oversample       & $20\times$ (Sec.~\ref{sec:impl:sampling}) \\
+    Augment.  & Resize $\rightarrow$ crop & $256 \rightarrow 224$ \\
+              & Random horizontal flip & $p=0.5$ \\
+              & Colour jitter          & $0.2$ each channel \\
+              & Random erasing         & $p=0.1$, scale $(0.02,0.1)$ \\
+              & mixup \autocite{zhang2018mixup} & $\alpha=0.2$ \\
+              & Test-time augmentation & H-flip averaging \\
+    Schedule  & Batch size            & $128$ \\
+              & Epochs                & $30$ \\
+              & Patience              & $8$ (early stop on val acc) \\
+              & Image size            & $224\times 224$, RGB \\
+    Hardware  & Accelerator           & NVIDIA T4 (GCP) \\
+    \bottomrule
+  \end{tabular}
+  \caption{Hyperparameters used to train the generic model. Gradient-based optimization and weighted random sampling are topics covered in the course; mixup, label smoothing and test-time augmentation are common regularizers documented in the cited papers.}
+  \label{tab:hparam}
+\end{table}
+
+Figure~\ref{fig:curves} shows the per-epoch training and validation loss and the per-source validation accuracy. The training loss decreases monotonically from about $1.46$ at epoch $1$ to $0.66$ at epoch $30$, with no late-stage divergence; the validation loss tracks the training loss closely and stops falling around epoch $20$, which is consistent with the overall validation accuracy plateauing in the same range. The per-source curves on the right panel make the cross-domain gap visible already at training time: the FER+ and RAF-DB validation slices climb past $80\%$ within the first ten epochs, but the self-captured validation slice (user1) saturates around $58\%$ even with the subject-aware oversampler enabled. This is the empirical signature that motivates the personalization stage of Section~\ref{sec:impl:personalize}.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{training_curves.png}
+  \caption{Per-epoch training curves for the generic ResNet-18 model. Left: training and validation cross-entropy loss decrease together over $30$ epochs, with the training loss falling from $1.46$ to $0.66$ and the validation loss plateauing around epoch $20$ at $0.93$. Right: validation accuracy decomposed by source. The public-source slices (FER+, RAF-DB) climb fastest; the self-captured slice plateaus much lower, foreshadowing the cross-subject failure analyzed in Section~\ref{sec:results:failure}.}
+  \label{fig:curves}
+\end{figure}
+
+\subsection{Subject-Aware Sampling}
+\label{sec:impl:sampling}
+
+As Table~\ref{tab:datasummary} shows, the self-captured slice is only about $1.4\%$ of the training set. Under uniform sampling a batch of $128$ frames contains less than two self-captured frames on average. This is much too few for the backbone to learn the kind of frames it will see at deployment time.
+
+To fix this we attach a \texttt{WeightedRandomSampler} to the PyTorch data loader and give each self-captured row a sampling weight of $20$. Every public-source row keeps weight $1$. The sampler draws indices with replacement, so the expected number of self-captured frames per epoch is about $555 \times 20 = 11{,}100$, which is on the same order as the public slice. The class balance of each public source is kept the same because we set all public-source weights to $1$. The sampler only rebalances along the source axis, not along the class axis. Algorithm~\ref{alg:sampler} gives the pseudocode. The actual implementation is a few lines of Python and uses the standard PyTorch \texttt{DataLoader} API through one keyword argument.
+
+\begin{algorithm}[H]
+\small
+\caption{Subject-aware weighted random sampler}
+\label{alg:sampler}
+\begin{algorithmic}[1]
+\Require Training set $\mathcal{D}_{\text{tr}}$ with per-row source
+         label $s_i \in \{\text{self},\text{ferplus},\text{rafdb}\}$;
+         oversample factor $\rho$
+\Function{BuildSampler}{$\mathcal{D}_{\text{tr}}, \rho$}
+  \State $\mathbf{w} \gets$ empty vector of length $|\mathcal{D}_{\text{tr}}|$
+  \For{$i = 1$ to $|\mathcal{D}_{\text{tr}}|$}
+    \State $w_i \gets \rho$ \textbf{if} $s_i = \text{self}$ \textbf{else} $1$
+  \EndFor
+  \State \Return \texttt{WeightedRandomSampler}$(\mathbf{w},
+         \text{num\_samples}=|\mathcal{D}_{\text{tr}}|,
+         \text{replacement}=\text{True})$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+The idea is the same as the class oversampling trick used in long-tailed image classification, but here the imbalance is along the data source axis instead of the class axis. Using $\rho=20$ raises self-captured validation accuracy by about five percentage points during training and changes the public-source validations by less than one percentage point (see Section~\ref{sec:results:overall}).
+
+\subsection{Optional Personalization Layer}
+\label{sec:impl:personalize}
+
+Even with subject-aware sampling the generic model reaches only $21.8\%$ test accuracy on the held-out subject (Section~\ref{sec:results:overall}). To close this gap we add a short second training stage that adapts the network to a target user using a small number of their own frames.
+
+The personalization stage loads \texttt{best.pt} and the target subject $u^\star$, reads all reviewed frames of $u^\star$ from \texttt{prelabels.csv}, and splits them inside the subject (class-stratified $80/20$) into a fine-tune set and a held-out evaluation set. We then freeze \texttt{conv1}, \texttt{bn1}, \texttt{layer1}, \texttt{layer2} and \texttt{layer3} and update only \texttt{layer4} plus the final \texttt{fc} ($8.40$M of $11.18$M parameters, $75\%$). The trainable parameters are tuned for five epochs with AdamW, $lr=1\times 10^{-4}$, weight decay $1\times 10^{-4}$, batch size $32$ and plain cross-entropy (no class weighting at this stage). The choice of $lr=1\times 10^{-4}$ is itself the outcome of a small learning-rate sweep reported in Section~\ref{sec:results:personalize} (Table~\ref{tab:ftlr}). We then score both the generic and the personalized checkpoint on the same held-out $20\%$.
+
+Freezing the first three residual stages follows a standard result: the early convolutional blocks learn general features (edges and textures) that transfer well across people, while the upper blocks and the head learn features that are tied to a specific person and need to be retrained \autocite{ganin2015dann, finn2017maml}. We unfreeze \texttt{layer4} because almost a quarter of the network's parameters live in that block. When we tried freezing \texttt{layer4} too, the network under-fit the target subject and the personalization gain went down.
+
+\subsection{Application Deployment as EmotionLens}
+\label{sec:impl:deploy}
+
+The personalized checkpoint is the inference backbone of \emph{EmotionLens}, an interactive emotion-recognition web application. The backend is a FastAPI server with a WebSocket endpoint: webcam frames stream from the browser to the server, each frame is passed through MTCNN \autocite{zhang2016mtcnn} for face detection, the cropped face is resized to $224 \times 224$ and normalized with ImageNet statistics, and the personalized ResNet-18 returns a seven-class softmax. We apply exponential moving average smoothing on the softmax so the predicted class does not flicker frame to frame. Face detection and classification together complete in well under $50$~ms per frame on a recent laptop GPU, so the overlay updates at near-camera framerate.
+
+The application exposes five independent analysis lenses on top of the same inference stream: a crowd-emotion histogram, an emotion alert that fires when negative emotions persist, an emotion-timeline diary, a public-speaking nervousness index, and a mimic game. Each lens is a separate Python module that consumes the seven-dimensional softmax; none of them required any change to the model. The frontend is vanilla HTML/CSS/JS with Swiper.js for lens switching, and public access is provided through a Cloudflare Tunnel because browser \texttt{getUserMedia} requires HTTPS.

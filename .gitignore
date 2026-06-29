@@ -1,0 +1,38 @@
+# Local config — may contain API keys, NEVER commit
+config.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & Models
+data/
+runs/
+*.zip
+*.pt
+*.pth
+*.onnx
+
+# Documents & Images
+*.pdf
+*.jpg
+*.png
+*.txt
+
+# AI Coworking stuff
+.gemini/
+AGENTS.md
+!requirements.txt

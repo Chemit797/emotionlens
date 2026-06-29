@@ -1,0 +1,415 @@
+% !TEX program = xelatex
+\documentclass[12pt,a4paper]{article}
+\input{config.tex}
+
+\title{\textbf{EmotionLens: A Cross-Domain Facial Expression Recognition Model}}
+\author{Group X \\ XMUM 2604 Natural Language Processing / Deep Learning}
+\date{June 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We trained a ResNet18-based facial expression recognition model on three complementary data sources: FERPlus with 10-voter soft labels, RAF-DB with real-world faces, and a self-captured dataset of 1,123 manually reviewed frames from six group members. Starting from the coursework baseline---FER2013 hard labels with a VGG16 backbone, which scored 11.6\% on our real-face test set---we made six rounds of training improvements, each time changing only one variable. Switching from hard labels to 10-voter soft labels gave the largest single gain (+35.2pp, from 9.2\% to 44.4\% on real faces). Adding RAF-DB and self-captured data brought the next gain (+20.0pp, from 44.4\% to 64.5\%), recovering recognition of sadness, disgust, and fear from 0\% to 53--60\%. Replacing VGG16 with ResNet18 contributed essentially nothing ($-$2.3pp). The final model reaches 89.0\% on the FERPlus test set and 64.5\% on unseen real faces. We deployed it as EmotionLens, a real-time web application with five swappable analysis lenses all consuming the same inference engine.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%=====================================================================
+\section{Introduction}
+%=====================================================================
+
+Facial expression recognition (FER) enables automated emotion perception at scale. Unlike human observers, a model runs 24/7 with consistent criteria, making it useful for classroom engagement tracking, human-computer interaction, online proctoring, and mental health screening.
+
+The problem is that models trained on curated lab datasets often collapse when deployed on real faces they have never seen. Standard FER benchmarks like FER2013 consist of $48\times48$ grayscale images crawled from the web, each labeled by a single annotator. A model that exceeds 85\% on such a test set may perform near random chance on in-the-wild faces captured by a laptop webcam under ordinary lighting. This is the domain gap: the model learns dataset-specific shortcuts rather than emotion-generic features.
+
+The coursework baseline route suggests starting from FER2013 with a VGG16 backbone. We faithfully reproduced this: 69.5\% on the FER2013 standard test set, but only 11.6\% on our own self-captured dataset of 1,123 real-face images. That 58-percentage-point gap is where our work begins.
+
+We trained a ResNet18 model on three complementary data sources. FERPlus provides the same images as FER2013 but with 10 crowd-workers voting per sample, producing soft label distributions that dramatically reduce annotation noise. RAF-DB contributes real-world face images under diverse conditions, compensating for the lab-data bias of FERPlus. Our self-captured set adds 1,123 manually reviewed frames from six Asian group members, taken with laptop webcams in ordinary indoor settings. During training, we made six rounds of improvements, each time changing exactly one variable. The final model achieves 89.0\% on the FERPlus test set and 64.5\% on real faces---a 52.9pp improvement over the baseline. We deployed this model as EmotionLens, a real-time web application whose five analysis lenses consume the same inference engine and can be swapped without modifying the model.
+
+The remainder of this report is organized as follows. Section 2 reviews the data, architectures, and training techniques we drew on. Section 3 describes the datasets we used. Section 4 details how we implemented the model and the training process. Section 5 presents the model's performance. Section 6 concludes.
+
+%=====================================================================
+\section{Literature Review}
+%=====================================================================
+
+This section covers the prior work that informed our choices: which datasets to use, which architecture to pick, and which training techniques to apply.
+
+\subsection{Data: From Hard Labels to Soft Labels to Real Faces}
+
+FER2013 (Goodfellow et al., 2013) was the first large-scale FER benchmark, with 35,887 $48\times48$ grayscale images each assigned a single hard label by one annotator. While historically important, single-annotator labeling introduces substantial noise---facial expressions are inherently ambiguous, and one person's judgment is unreliable.
+
+FERPlus (Barsoum et al., 2016) reuses the exact same images but changes the annotation protocol: each image is independently labeled by 10 crowd-workers, producing a probability distribution over emotion classes. For example, an image that one annotator labeled ``happy'' in FER2013 might receive a distribution of $[0.7_{\text{happy}}, 0.1_{\text{neutral}}, 0.1_{\text{surprise}}, 0.1_{\text{contempt}}]$ in FERPlus, reflecting genuine annotator disagreement. These soft labels significantly reduce the impact of individual annotation errors. FERPlus also adds a contempt class (8 classes total); we discard it to unify with our other 7-class sources.
+
+RAF-DB (Li \& Deng, 2019) contains approximately 15,344 real-world face images with 7-class labels. Unlike FERPlus images, which are predominantly low-resolution web crops, RAF-DB covers diverse real-world conditions---varying poses, illuminations, and backgrounds. This makes it a useful bridge between lab data and deployment scenarios.
+
+The key observation is that label noise (FER2013's single-annotator hard labels) and domain bias (lab images vs.\ real faces) are two independent problems. Solving one does not solve the other; they require separate remedies.
+
+\subsection{Architecture: Why We Picked ResNet18}
+
+We compared three architectures under identical training conditions before committing to one.
+
+VGG16 (Simonyan \& Zisserman, 2014) is a classic CNN with 138M parameters and a simple stacked-convolution design. It works reasonably on FER2013 (69.5\%) but its large parameter count makes inference slow on consumer hardware.
+
+ResNet (He et al., 2016) introduced residual connections: each block learns a residual function $\mathcal{F}(x)$ rather than a direct mapping $\mathcal{H}(x)$, with output $\mathcal{H}(x) = \mathcal{F}(x) + x$. This ``shortcut'' path allows gradients to flow directly through the network, mitigating the vanishing gradient problem. ResNet18 has only 11.2M parameters (roughly 1/12 of VGG16), and its ImageNet pre-trained features transfer well to FER tasks.
+
+EfficientNet-B0 (Tan \& Le, 2019) uses neural architecture search to balance depth, width, and resolution, achieving just 5.3M parameters. However, under our training recipe (35 epochs, AdamW, lr=$3\times10^{-4}$), it only reached 41.0\% on the FERPlus test set---far below ResNet18's 79.9\%. We suspect the lightweight design needs more epochs to converge than our hardware budget allowed.
+
+We chose ResNet18 because it offered the best practical trade-off: much lighter than VGG16, much more accurate than EfficientNet-B0 under our training constraints, and stable to train with residual connections.
+
+\subsection{Training Techniques}
+
+Several established techniques helped regularize our model and improve generalization:
+
+\textbf{mixup} (Zhang et al., 2018) trains on convex combinations of random image pairs: $\tilde{x} = \lambda x_i + (1-\lambda) x_j$, with labels mixed in the same proportion. This exposes the model to a continuous space of ``virtual'' training samples, improving robustness to distribution shift.
+
+\textbf{Label smoothing} (Szegedy et al., 2016) replaces one-hot targets with softened versions: $y_{\text{smooth}} = (1-\varepsilon) \cdot y_{\text{hard}} + \varepsilon/K$. With $\varepsilon=0.1$, the model is prevented from becoming overconfident on any single class, which improves test-set generalization.
+
+\textbf{AdamW} (Loshchilov \& Hutter, 2019) decouples weight decay from the adaptive learning rate, providing better generalization than standard Adam and faster convergence than SGD with momentum. This matters when training budget is limited to a few dozen epochs on a single GPU.
+
+%=====================================================================
+\section{Data Set}
+%=====================================================================
+
+\subsection{Public Datasets}
+
+\textbf{FER2013} (Goodfellow et al., 2013). 35,887 $48\times48$ grayscale images in CSV format, each assigned a single hard label from the 7 Ekman classes. We use FER2013 only for the initial baseline model.
+
+\textbf{FERPlus} (Barsoum et al., 2016). The official Microsoft release in parquet format. 35,803 images (the same pictures as FER2013), but each annotated by 10 independent crowd-workers, producing an 8-class probability distribution. We drop the contempt class and normalize the remaining 7 classes to sum to 1. Training on FERPlus uses soft cross-entropy loss against the 10-voter distribution.
+
+\textbf{RAF-DB} (Li \& Deng, 2019). Approximately 15,344 real-world face images (basic set) with 7-class hard labels. RAF-DB faces are better aligned and cover more diverse real-world conditions than FERPlus web crops.
+
+\subsection{Self-Captured Data}
+
+To evaluate how well our model generalizes to faces of our own group members, we collected a self-captured dataset.
+
+\textbf{Collection protocol.} Six group members each recorded short video sessions on their personal laptop webcams under ordinary indoor conditions---classrooms or dormitories, natural lighting, seated approximately 40--60 cm from the screen. For each of the seven target emotion classes, the contributor posed the corresponding expression while a script saved frames at a fixed interval.
+
+\textbf{Annotation workflow.} After recording, frames were extracted at regular intervals. A small pre-trained FER model produced weak labels as an initial guess. Group members then manually reviewed every frame: correcting errors, removing blurred or ambiguous samples. The final reviewed set contains 1,123 frames.
+
+\textbf{Split.} We use an 80/20 stratified random split (train/validation). We acknowledge that a subject-disjoint split would be methodologically preferable; we discuss this in Section 6 as a limitation.
+
+\subsection{Preprocessing}
+
+All images go through a unified pipeline: (1) resize to $224\times224$ RGB; (2) normalize with ImageNet statistics ($\mu=[0.485, 0.456, 0.406]$, $\sigma=[0.229, 0.224, 0.225]$).
+
+For FER2013 and FERPlus ($48\times48$ grayscale originals), we resize and replicate the single channel to three channels. RAF-DB RGB images are directly resized. Self-captured frames are first passed through MTCNN (Zhang et al., 2016) for face detection and cropping, then resized.
+
+\begin{table}[H]
+\centering
+\caption{Dataset statistics}
+\begin{tabular}{lcccc}
+\toprule
+Source & Train & Validation & Test & Total \\
+\midrule
+FER2013 & 28,709 & 3,589 & 3,589 & 35,887 \\
+FERPlus & 28,709 & 3,546 & 3,546 & 35,803 \\
+RAF-DB  & $\sim$12,000 & -- & $\sim$3,000 & $\sim$15,344 \\
+Self    & 899 & 224 & -- & 1,123 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=====================================================================
+\section{Implementation}
+%=====================================================================
+
+This section describes how we built the model: the architecture we chose, the training recipe we used, the six rounds of improvements we made during training, and how we deployed the result.
+
+\subsection{Architecture Selection}
+
+We compared three architectures under the same training conditions before settling on ResNet18. Table~\ref{tab:arch_compare} shows the results.
+
+\begin{table}[H]
+\centering
+\caption{Architecture comparison under identical training recipes}
+\label{tab:arch_compare}
+\begin{tabular}{lccc}
+\toprule
+Architecture & Params & Test Set (trained on) & Self Data \\
+\midrule
+VGG16       & 138M  & 69.5\% (FER2013)  & 11.6\% \\
+EfficientNet-B0 & 5.3M & 41.0\% (FERPlus)  & 19.4\% \\
+\textbf{ResNet18} & \textbf{11.2M} & \textbf{79.9\% (FERPlus)} & \textbf{44.4\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+VGG16's 138M parameters make inference slow on our laptop GPU. EfficientNet-B0, despite its theoretical efficiency, underperformed significantly under our 35-epoch training budget---we suspect it needs more epochs to converge. ResNet18's residual connections (He et al., 2016) allow gradients to flow through shortcut paths, enabling stable convergence within 35 epochs. Its 11.2M parameters---roughly 1/12 of VGG16---make real-time inference practical.
+
+Our ResNet18 configuration: initialized with \texttt{torchvision.models.resnet18(weights=``IMAGENET1K\_V1'')}, the final 1000-class fully connected layer replaced with \texttt{Linear(512, 7)}. Input: $224\times224$ RGB with ImageNet normalization. Total trainable parameters: 11,180,103.
+
+\subsection{Training Recipe}
+
+Having settled on ResNet18, we designed a training recipe that addresses three practical challenges: data that comes in two incompatible label formats, a limited hardware budget (one laptop GPU, 35 epochs), and severe class imbalance. The subsections below are organized by the problem each group of techniques solves, rather than as an inventory of ingredients.
+
+\subsubsection{Handling Two Label Formats}
+
+Our training data mixes two kinds of supervision that demand different treatment.
+
+\textbf{Hard labels} (FER2013, RAF-DB, self-captured) are single integer classes. For these we use standard Cross-Entropy:
+\begin{equation}
+\mathcal{L}_{\text{hard}} = -\log p_{\text{model}}(y_{\text{true}})
+\end{equation}
+The limitation is well-known: when the annotator makes a mistake---common in facial expression data, where brief micro-expressions are easy to misread---this loss penalizes the model for being ``wrong'' about a label that was wrong to begin with. It forces 100\% confidence toward a potentially incorrect target.
+
+\textbf{Soft labels} (FERPlus, 10-voter distributions) replace one person's guess with a crowd consensus. For these we use Soft Cross-Entropy:
+\begin{equation}
+\mathcal{L}_{\text{soft}} = -\sum_{k=1}^{K} p_{\text{voter}}(k) \cdot \log p_{\text{model}}(k)
+\end{equation}
+where $p_{\text{voter}}(k)$ is the fraction of 10 annotators who voted for class $k$. If 7 voted ``happy,'' 1 ``neutral,'' 1 ``surprise,'' and 1 ``contempt,'' the target becomes $[0.7, 0.1, 0.1, 0.0, 0.0, 0.0, 0.1]$. The model no longer needs to be 100\% certain about inherently ambiguous expressions, and a single mistaken annotator can at most shift the target distribution by 0.1---not flip it entirely.
+
+\textbf{Why not soft labels everywhere?} RAF-DB and our self-captured data each have only one label per image. Converting them to pseudo-soft labels (e.g., via label smoothing alone) would not recover the genuine inter-annotator variation that FERPlus's 10 independent judgments capture. We therefore keep the loss function matched to the label provenance: hard CE where labels are single-annotator, soft CE where we have crowd distributions.
+
+The impact of this choice is concrete: switching from hard CE on FER2013 to soft CE on FERPlus was the single largest accuracy gain in our entire training process (Section~4.3).
+
+\subsubsection{Fast Convergence Under Hardware Constraints}
+
+We train on a single RTX 4060 Laptop GPU (8GB VRAM) and target convergence within 35 epochs. This rules out approaches that need large batch sizes or long schedules.
+
+\textbf{Optimizer choice.} SGD with momentum is the default in many vision pipelines, but it converges gradually and benefits from large batch sizes---on our hardware, SGD with FP32 reaches batch size 64 before exhausting VRAM, which makes each epoch noisier. AdamW (Loshchilov \& Hutter, 2019) combines adaptive per-parameter learning rates with decoupled weight decay: $\beta_1=0.9$, $\beta_2=0.999$, $\text{lr}=3\times10^{-4}$, $\text{wd}=1\times10^{-4}$. The decoupling means weight decay regularizes independently of the adaptive gradient scaling, giving better generalization than standard Adam while converging faster than SGD---important when we only have 35 epochs.
+
+\textbf{Mixed precision.} We use Automatic Mixed Precision (\texttt{torch.amp.GradScaler}): forward passes run in FP16 for roughly 40\% speedup, the loss is scaled before backpropagation to prevent gradient underflow in low-magnitude channels, and gradients are unscaled before the optimizer applies the update. The practical benefit is that FP16 halves the memory footprint of activations, letting us raise the batch size from 64 to 128. More samples per step means more stable gradient estimates.
+
+\textbf{Learning rate schedule.} We use CosineAnnealingLR with $T_{\max}=35$, decaying the learning rate smoothly from $3\times10^{-4}$ to near zero. Unlike step decay---which requires choosing decay milestones by hand and risks sudden jumps in the loss landscape---cosine annealing lets later epochs explore progressively finer minima without manual intervention. We picked $3\times10^{-4}$ over the common $1\times10^{-4}$ because pilot runs showed $1\times10^{-4}$ converged slower without improving final accuracy; $3\times10^{-4}$ reached the same validation performance roughly 8--10 epochs earlier.
+
+\subsubsection{Preventing Class Imbalance from Skewing Training}
+
+FER2013 and FERPlus are heavily skewed: happiness has over 7,000 training samples while disgust has approximately 400 (a ratio exceeding 17:1). Training naively on the natural distribution causes the model to optimize almost entirely for the majority classes. Minority classes---particularly disgust, fear, and anger---receive negligible gradient signal.
+
+We use WeightedRandomSampler with per-class weights $w_c = 1 / \text{count}(c)$, sampling with replacement to draw the full dataset size each epoch. Minority classes are oversampled; majority classes are undersampled. Each batch therefore contains a roughly balanced mix of all seven emotions, and every optimizer step receives gradient information from the full label space.
+
+\textbf{Caveat.} Oversampling inevitably repeats the same minority-class images multiple times per epoch, which could encourage memorization. The regularization techniques in the next subsection are designed in part to counter this.
+
+\subsubsection{Regularization: Keeping the Model from Memorizing}
+
+Three techniques work together to prevent overfitting.
+
+\textbf{Label Smoothing} ($\varepsilon=0.1$). Hard one-hot targets $[0,0,1,0,0,0,0]$ are softened to $[0.015,0.015,0.9,0.015,0.015,0.015,0.015]$. This discourages the model from driving its predicted probability for the target class toward 1.0---behavior that is especially harmful when some of those targets are annotation errors (Szegedy et al., 2016). A side benefit: the softened distribution is closer in spirit to the FERPlus soft targets, creating some consistency across our heterogeneous label sources.
+
+\textbf{mixup} ($\alpha=0.2$, Zhang et al., 2018). Each training step blends two random images and their labels: $\tilde{x} = \lambda x_i + (1-\lambda) x_j$, $\tilde{y} = \lambda y_i + (1-\lambda) y_j$, with $\lambda \sim \text{Beta}(\alpha,\alpha)$. Training on convex combinations exposes the model to a continuum of ``in-between'' samples rather than only discrete training points. This makes decision boundaries smoother and improves robustness to distribution shift. We chose $\alpha=0.2$ (conservative mixing) because facial expressions are subtle---larger $\alpha$ values would blend distinct emotions into unrecognizable averages, introducing a new form of label noise rather than reducing it.
+
+\textbf{Data augmentation.} RandomHorizontalFlip ($p=0.5$), ColorJitter (brightness/contrast/saturation each 0.2), and RandomErasing ($p=0.1$, scale 0.02--0.1 of image area). At test time, we average predictions over the original and horizontally flipped image---a cost-free operation that typically yields 1--2pp improvement by making predictions symmetric.
+
+These three techniques are complementary: label smoothing operates on the target space, mixup on the input--label relationship, and augmentation on the input space alone. Using all three together provides stronger regularization than any single one could, without the added computational cost of, for example, dropout tuning or stochastic depth.
+
+\subsubsection{Hyperparameter Summary}
+
+\begin{table}[H]
+\centering
+\caption{Training hyperparameters used across all model versions}
+\begin{tabular}{lll}
+\toprule
+Hyperparameter & Value & Rationale \\
+\midrule
+Optimizer    & AdamW ($\beta_1$=0.9, $\beta_2$=0.999) & Fast convergence + decoupled weight decay \\
+Learning rate & $3\times10^{-4}$ & Faster than $1\times10^{-4}$ without oscillation \\
+Weight decay & $1\times10^{-4}$ & Standard value \\
+LR schedule  & CosineAnnealing, $T_{\max}$=35 & Smooth, no manual milestones \\
+Epochs       & 35 & Validation accuracy saturates near epoch 30--35 \\
+Batch size   & 128 (VGG16: 64) & Maximum under 8GB VRAM with AMP \\
+Loss         & Hard CE / Soft CE & Matched to label type \\
+Label smoothing & 0.1 & Inception-v3 recommendation, prevents overconfidence \\
+Mixup $\alpha$ & 0.2 & Conservative; higher values smear expressions \\
+Hardware     & RTX 4060 Laptop (8GB) & Local training \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Training Improvement Process}
+
+This section traces how the model evolved through four training rounds, plus two evaluation rounds that validated what we had built. It is \emph{not} an experiment grid---at each step, we looked at what the model was failing on, identified the most likely bottleneck, changed one thing, and checked whether real-face performance improved. Keeping each change isolated was an engineering discipline that let us attribute gains cleanly, not a methodology for hypothesis testing.
+
+\subsubsection*{Round 1: Establishing the Starting Point}
+
+We began by training VGG16 on FER2013 hard labels, following the coursework baseline route exactly.
+
+\begin{center}
+\texttt{VGG16 + FER2013: FER2013 test 69.5\%, Self data 11.6\%}
+\end{center}
+
+On our self-captured real faces, the model was effectively non-functional. Looking at its predictions: it defaulted to ``neutral'' for the overwhelming majority of images, occasionally guessing ``happiness'' for faces with visible teeth. Every other emotion---sadness, anger, fear, disgust, surprise---was essentially invisible to it. The 58pp gap between FER2013 test accuracy and real-face accuracy told us the model was exploiting dataset-specific shortcuts rather than learning transferable expression features. This was our starting point.
+
+\subsubsection*{Round 2: Checking Whether Architecture Was the Bottleneck}
+
+Our first instinct was that VGG16---a design from 2014---might simply be too old. We replaced it with ResNet18, keeping everything else identical: same FER2013 data, same hard labels, same hyperparameters.
+
+\begin{center}
+\texttt{ResNet18 + FER2013: FER2013 test 69.9\%, Self data 9.2\%}
+\end{center}
+
+The result was unambiguous. On the standard test set, ResNet18 scored within 0.5pp of VGG16. On real faces, it was actually worse by 2.3pp. A more modern architecture, by itself, did nothing for generalization. The neutral-default behavior persisted. This told us something important: \emph{the bottleneck was not the model architecture.} The data---its labels, its domain, or both---was the problem. We stopped worrying about which backbone to use and turned our attention to what we were feeding it.
+
+\subsubsection*{Round 3: Fixing the Real Bottleneck---Label Quality}
+
+Since architecture was not the issue, we examined the training data. FER2013 labels come from a single annotator per image---and facial expressions are inherently ambiguous. An expression that one person calls ``fear'' another might call ``surprise.'' With only one annotator, there is no way to distinguish genuine class characteristics from individual annotator bias.
+
+We switched to FERPlus: the exact same 35,000 images, but now each has been labeled independently by 10 crowd-workers, producing a probability distribution rather than a point estimate. For the model, this meant soft CE instead of hard CE (Section~4.2). Everything else stayed the same: ResNet18 architecture, hyperparameters, 35 epochs.
+
+\begin{center}
+\texttt{ResNet18 + FERPlus: FERPlus test 79.9\%, Self data 44.4\% (+35.2pp)}
+\end{center}
+
+Real-face accuracy tripled. The same images, the same architecture, the same training recipe---the only difference was replacing one person's label with ten people's consensus. This confirmed that label noise, not model capacity or image resolution, had been the dominant bottleneck all along. The model was no longer being forced to memorize annotation errors as if they were ground truth.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\textwidth]{control_variable_chain.png}
+\caption{The model's real-face accuracy across four rounds of improvement}
+\label{fig:chain}
+\end{figure}
+
+\subsubsection*{Round 4: Teaching the Model What Real Faces Look Like}
+
+FERPlus fixed the label problem, but the images were still $48\times48$ grayscale web crops---far from the high-resolution color frames our webcam produces. Per-class results on our self-captured data confirmed this: sadness, disgust, and fear each had 0\% recall. The model had never seen a real-world face and could not recognize negative expressions on one.
+
+We added two sources of real-face training data. RAF-DB contributed approximately 15,000 real-scene images spanning varied poses, lighting conditions, and backgrounds. Our self-captured set added 1,123 manually reviewed frames from six team members, taken with laptop webcams in ordinary indoor settings---the closest available proxy for our deployment scenario. Architecture, optimizer, and hyperparameters all stayed the same.
+
+\begin{center}
+\texttt{ResNet18 + F+R+S: FERPlus test 89.0\%, Self data 64.5\% (+20.1pp)}
+\end{center}
+
+The overall gain of +20.1pp understates what actually happened. Per-class recall tells the real story: sadness went from 0\% to 53.1\%, disgust from 0\% to 52.7\%, fear from 0\% to 59.5\%. The FERPlus-only model was literally blind to these emotions on real faces; adding diverse real-world training data taught it to see them for the first time. The model had graduated from recognizing expressions only in the abstract environment of web-crawled images to recognizing them on actual human faces.
+
+\subsubsection*{Round 5: Cross-Domain Evaluation---Checking Where the Model Works}
+
+At this point we had four model versions (VGG16+FER2013, ResNet18+FER2013, ResNet18+FERPlus, ResNet18+F+R+S). We evaluated all of them across three test sets---FERPlus, FER2013, and our self-captured data---to understand how domain-dependent their performance was. We also included EfficientNet-B0 (trained on FERPlus under the same recipe) and the open-source hustvl/fer library as reference points. Full results appear in Section~5.4.
+
+The pattern was consistent: every model performed best on the test set that matched its training distribution, and only the multi-source model (F+R+S) achieved usable accuracy on real faces. This is not a ``finding'' in the experimental sense---it is a sanity check that the model behaves as expected given what we trained it on.
+
+\subsubsection*{Round 6: Third-Party Baseline---Confirming the Problem Is in the Data, Not Our Code}
+
+We ran the open-source FER library (\texttt{hustvl/fer}, also trained on FER2013) on our self-captured data. Overall accuracy: 52.6\%. Per-class recall: neutral 95.7\%, happiness 68.0\%, disgust 0.0\%, anger 1.8\%. The pattern---neutral and happiness passable, negative emotions invisible---is identical to what we observed with our own VGG16+FER2013 model.
+
+Two completely independent implementations, trained on the same data source, produce the same failure mode. This confirms that the problem is FER2013's data, not any particular codebase's implementation choices.
+
+\subsubsection*{What the Four Rounds Produced}
+
+\begin{center}
+\texttt{11.6\% $\to$ 9.2\% $\to$ 44.4\% $\to$ 64.5\%}\\
+\texttt{(baseline) \ \ (architecture) \ \ (label quality) \ \ (data diversity)}\\
+\texttt{\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ --2.3pp \ \ \ \ +35.2pp \ \ \ \ \ +20.1pp}
+\end{center}
+
+Each round changed exactly one variable. The effects are cleanly attributable: architecture matters little ($-$2.3pp), label quality matters enormously (+35.2pp), and data diversity provides the final push (+20.1pp). The total improvement from baseline to final model is +52.9pp on real faces.
+
+This is the model we deploy. The next section describes the deployment.
+
+\subsection{Application Deployment}
+
+We deployed the best model (ResNet18 + F+R+S) as EmotionLens, a real-time web application. The backend uses FastAPI + uvicorn + WebSocket: webcam frames stream to the server, YuNet detects faces, ResNet18 infers 7-class probabilities, and exponential moving average smoothing produces stable predictions. Five independent analysis lenses---crowd emotion statistics, emotion alert, emotion timeline, nervousness index, and a mimic game---consume the same inference stream. Each lens is a standalone Python module; none required modifying the model. The frontend uses vanilla HTML/CSS/JS with Swiper.js for lens switching. Public access is provided via Cloudflare Tunnel (HTTPS is required for browser \texttt{getUserMedia}).
+
+The five lenses are examples, not the product. The engine outputs raw 7-dimensional probability vectors. Anyone can write a new lens that consumes this stream without touching the model code.
+
+%=====================================================================
+\section{Results and Analysis}
+%=====================================================================
+
+This section presents the performance of our model at each stage of improvement and across different test conditions.
+
+\subsection{Improvement Trajectory}
+
+Figure~\ref{fig:chain} (shown in Section~4.3) traces the model's real-face accuracy through four rounds of training. The starting point---VGG16 trained on FER2013 hard labels---achieved 11.6\% on our self-captured data. Replacing the architecture with ResNet18 brought this to 9.2\% ($-$2.3pp). Switching to FERPlus soft labels raised it to 44.4\% (+35.2pp). Adding RAF-DB and self-captured data brought it to 64.5\% (+20.1pp). The net gain over baseline: +52.9pp on real faces.
+
+\subsection{Architecture Comparison}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{architecture_ablation.png}
+\caption{VGG16 vs.\ ResNet18 on identical FER2013 data and training recipe}
+\label{fig:arch}
+\end{figure}
+
+On the standard FER2013 test set, VGG16 and ResNet18 differ by only 0.5pp (69.5\% vs.\ 69.9\%). On real faces, ResNet18 actually scores lower (9.2\% vs.\ 11.6\%). A more modern architecture, by itself, does not improve real-world generalization. The gains must come from data quality and diversity.
+
+\subsection{Per-Class Recall Analysis}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{per_class_recall_all.png}
+\caption{Per-class recall on self-captured data across four model versions}
+\label{fig:recall}
+\end{figure}
+
+The most striking finding is in the per-class breakdown (Figure~\ref{fig:recall}). The model trained on FERPlus only achieves exactly 0\% recall on sadness, disgust, and fear on real faces. It literally cannot recognize these emotions outside its training domain. After adding RAF-DB and self-captured data, recall on these three classes recovers to 53.1\%, 52.7\%, and 59.5\%, respectively.
+
+Even the best model shows a clear performance hierarchy. Neutral (78.0\%) and surprise (70.0\%) perform well; anger (55.7\%), disgust (52.7\%), sadness (53.1\%), and fear (59.5\%) lag behind. We believe this pattern reflects two underlying factors.
+
+First, basic expressions such as neutral and happiness are biologically rooted and expressed with high cross-cultural consistency---a smile is a smile. Negative emotions, by contrast, are more abstract and subject to greater individual and cultural variation in both expression and interpretation (Jack et al., 2012, \textit{PNAS}).
+
+Second, FERPlus and RAF-DB were annotated predominantly under Western cultural norms, whereas our self-captured test data come entirely from Asian participants. For culturally mediated expressions like disgust and anger, the mismatch between Western annotation standards and Asian facial expressions introduces an inherent ambiguity into the ground truth itself. In other words, the low recall on these emotion classes may reflect not a failure of model learning, but a structural ceiling on label consistency when annotations and test subjects come from different cultural backgrounds.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\textwidth]{self_confusion_matrix.png}
+\caption{Confusion matrix of the final model (ResNet18 + F+R+S) on self-captured data}
+\label{fig:cm}
+\end{figure}
+
+\subsection{Cross-Domain Evaluation}
+
+\begin{table}[H]
+\centering
+\caption{All model versions evaluated across all test sets}
+\label{tab:cross}
+\begin{tabular}{lccc}
+\toprule
+Model & FERPlus Test & FER2013 Test & Self Data \\
+\midrule
+VGG16 (FER2013)           & 7.1\%  & 69.5\% & 11.6\% \\
+ResNet18 (FER2013)        & 9.0\%  & 69.9\% & 9.2\%  \\
+ResNet18 (FERPlus only)   & 79.9\% & 8.5\%  & 44.4\% \\
+ResNet18 (F+R+S)          & \textbf{89.0\%} & 7.0\%  & \textbf{64.5\%} \\
+EfficientNet-B0 (FERPlus) & 41.0\% & 10.6\% & 19.4\% \\
+\midrule
+FER Library (hustvl/fer)  & ---    & ---    & 52.6\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Each model performs best on the domain it was trained on---an expected pattern. The notable result is that only the multi-source model (F+R+S) achieves practically usable accuracy on real faces (64.5\%). The FER library baseline scores 52.6\% overall on self data but with disgust recall at 0.0\% and anger at 1.8\%---the same negative-emotion blindness seen in our FER2013-trained models. The consistency between two independent implementations trained on the same data source reinforces the point: the bottleneck is FER2013's label quality and domain coverage, not implementation.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\textwidth]{cross_domain_radar.png}
+\caption{Cross-domain radar chart across five models and three test sets}
+\label{fig:radar}
+\end{figure}
+
+\subsection{Domain Gap}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{domain_gap.png}
+\caption{Laboratory accuracy vs.\ real-face accuracy for each model version}
+\label{fig:gap}
+\end{figure}
+
+The gap between lab and real-face accuracy shrinks from 57.9pp (VGG16+FER2013: 69.5\% lab vs.\ 11.6\% real) to 24.5pp (ResNet18+F+R+S: 89.0\% lab vs.\ 64.5\% real). Adding diverse real-world training data cut the domain gap by more than half.
+
+\subsection{Factor Contributions}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{contribution_breakdown.png}
+\caption{Decomposition of the 52.9pp total improvement into three factors}
+\label{fig:contrib}
+\end{figure}
+
+Breaking down the 52.9pp net improvement: architecture change (VGG16$\to$ResNet18) contributed $-$2.3pp; label quality (hard$\to$10-voter soft labels) contributed +35.2pp; data diversity (adding RAF-DB and self-captured data) contributed +20.1pp. The takeaway is actionable: improving label quality yields the highest return on investment; adding diverse real-world data is the second most effective step; switching architectures alone is unlikely to help.
+
+%=====================================================================
+\section{Conclusion}
+%=====================================================================
+
+We trained a ResNet18-based facial expression recognition model using three complementary data sources: FERPlus with 10-voter soft labels, RAF-DB real-world faces, and a self-captured dataset of 1,123 manually reviewed frames. Starting from the FER2013+VGG16 baseline (11.6\% on real faces), six rounds of training improvements raised real-face accuracy to 64.5\%---a 52.9pp gain. The largest single step came from switching hard labels to 10-voter soft distributions (+35.2pp); the second came from adding diverse real-world training data (+20.1pp); changing the architecture contributed essentially nothing ($-$2.3pp).
+
+For anyone building FER systems, the practical lesson is clear: if you have one improvement budget, spend it on label quality; if you have two, also invest in data diversity. A new architecture alone is unlikely to move the needle. The model is deployed as EmotionLens, a real-time web application where five analysis lenses demonstrate that the inference engine generalizes across use cases. The engine is the reusable core; the lenses are swappable; what users build on top is limited only by what they need.
+
+
+\nocite{*}
+\printbibliography
+
+\end{document}
