@@ -1,5 +1,7 @@
 # EmotionLens 🎭
 
+[**English**](./README.md) | [**中文简体**](./README_zh-CN.md)
+
 ![EmotionLens](https://img.shields.io/badge/Status-Active-success) ![Python](https://img.shields.io/badge/Python-3.8%2B-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-Framework-009688)
 
 EmotionLens is a real-time, multi-person facial emotion recognition web application. Built upon a custom-trained **EfficientNet-B0** model and powered by **YuNet** for robust face detection, it captures and analyzes facial expressions in real-time. 
